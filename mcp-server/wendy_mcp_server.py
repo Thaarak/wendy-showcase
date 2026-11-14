@@ -1,0 +1,647 @@
+"""
+Wendy Wedding Planning HTTP Server
+
+This server provides HTTP endpoints for wedding planning including:
+- Guest management with SQLite database
+- Email invitation system
+- RSVP tracking
+- Venue finding with AI
+"""
+
+import os
+import httpx
+import smtplib
+from datetime import datetime
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Any, List, Literal, Optional
+
+import anthropic
+import aiosqlite
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from pydantic import BaseModel
+import openai
+
+app = FastAPI(
+    title="Wendy Wedding Planning Server",
+    description="AI-powered wedding planning assistant with guest management, email invitations, and venue finding.",
+    version="1.0.0"
+)
+
+
+# Pydantic models
+class Guest(BaseModel):
+    id: int
+    name: str
+    email: str
+    rsvp: str
+    created_at: str
+
+
+class SaveGuestRequest(BaseModel):
+    name: str
+    email: str
+    rsvp: Literal["yes", "no", "maybe", "unknown"]
+
+
+class SendInviteRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
+
+
+class SendInviteResponse(BaseModel):
+    result: str
+
+
+class UpdateRSVPRequest(BaseModel):
+    email: str
+    rsvp: str
+
+
+class UpdateRSVPResponse(BaseModel):
+    result: str
+
+
+class FindVenuesRequest(BaseModel):
+    location: str
+
+
+class FindVenuesResponse(BaseModel):
+    result: str
+
+
+class VenueReservationRequest(BaseModel):
+    user_name: str
+    user_email: str
+    venue_name: str
+    venue_email: str
+    budget: str
+    guest_count: int
+    date: str
+    special_notes: Optional[str] = None
+
+class VenueReservationResponse(BaseModel):
+    result: str
+    reservation_id: Optional[int] = None
+    error: Optional[str] = None
+
+
+# Database helper class
+class Database:
+    """Simple async wrapper for SQLite."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn: aiosqlite.Connection | None = None
+
+    async def connect(self):
+        """Connect to the database."""
+        self.conn = await aiosqlite.connect(self.db_path)
+        self.conn.row_factory = aiosqlite.Row
+        await self.init_schema()
+
+    async def close(self):
+        """Close the database connection."""
+        if self.conn:
+            await self.conn.close()
+
+    async def init_schema(self):
+        """Initialize the database schema."""
+        if not self.conn:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self.conn.cursor()
+
+        # Create guests table
+        await cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guests (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                rsvp TEXT DEFAULT 'unknown',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # Create venue_reservations table
+        await cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS venue_reservations (
+                id INTEGER PRIMARY KEY,
+                user_name TEXT NOT NULL,
+                user_email TEXT NOT NULL,
+                venue_name TEXT NOT NULL,
+                venue_email TEXT NOT NULL,
+                budget TEXT,
+                guest_count INTEGER,
+                date TEXT,
+                special_notes TEXT,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await self.conn.commit()
+
+    async def add_guest(self, name: str, email: str) -> dict:
+        """Add a new guest to the database."""
+        if not self.conn:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self.conn.cursor()
+
+        # Use upsert to handle duplicate emails
+        await cursor.execute(
+            """
+            INSERT INTO guests (name, email, rsvp, created_at)
+            VALUES (?, ?, 'unknown', CURRENT_TIMESTAMP)
+            ON CONFLICT(email) DO UPDATE SET name=excluded.name
+            """,
+            (name, email)
+        )
+
+        await self.conn.commit()
+
+        # Get the inserted/updated guest
+        await cursor.execute("SELECT * FROM guests WHERE email = ?", (email,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_all_guests(self) -> list[dict]:
+        """Get all guests."""
+        if not self.conn:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self.conn.execute("SELECT * FROM guests ORDER BY created_at DESC")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def update_guest_rsvp(self, email: str, rsvp: str) -> dict | None:
+        """Update a guest's RSVP status."""
+        if not self.conn:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self.conn.cursor()
+        await cursor.execute(
+            "UPDATE guests SET rsvp = ? WHERE email = ?",
+            (rsvp, email)
+        )
+        await self.conn.commit()
+
+        # Get the updated guest
+        await cursor.execute("SELECT * FROM guests WHERE email = ?", (email,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def add_venue_reservation(self, user_name: str, user_email: str, venue_name: str, venue_email: str, budget: str, guest_count: int, date: str, special_notes: Optional[str], status: str, error_message: Optional[str]) -> dict:
+        """Add a new venue reservation log to the database."""
+        if not self.conn:
+            raise RuntimeError("Database not connected")
+        cursor = await self.conn.cursor()
+        await cursor.execute(
+            """
+            INSERT INTO venue_reservations (user_name, user_email, venue_name, venue_email, budget, guest_count, date, special_notes, status, error_message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (user_name, user_email, venue_name, venue_email, budget, guest_count, date, special_notes, status, error_message)
+        )
+        await self.conn.commit()
+        reservation_id = cursor.lastrowid
+        await cursor.execute("SELECT * FROM venue_reservations WHERE id = ?", (reservation_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+# Email helper class
+class EmailService:
+    """Email service for sending invitations."""
+
+    def __init__(self):
+        self.smtp_host = "smtp.gmail.com"
+        self.smtp_port = 465
+        self.smtp_user = os.getenv("WENDY_SMTP_USER", "")
+        self.smtp_pass = os.getenv("WENDY_SMTP_PASSWORD", "")
+
+    def send_invitation(self, to_email: str, guest_name: str = None) -> bool:
+        """Send a wedding invitation email."""
+        try:
+            # Create message
+            msg = MIMEText(
+                f"""
+                Dear {guest_name or 'Guest'},
+
+                You are cordially invited to our wedding!
+
+                We would be honored by your presence on our special day.
+                Please RSVP at your earliest convenience.
+
+                Best regards,
+                The Happy Couple
+                """,
+                'plain'
+            )
+
+            msg['Subject'] = 'You are invited to our wedding!'
+            msg['From'] = self.smtp_user
+            msg['To'] = to_email
+
+            # Send email
+            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=15) as server:
+                server.login(self.smtp_user, self.smtp_pass)
+                server.send_message(msg)
+
+            print(f"✅ Invitation sent to {to_email}")
+            return True
+
+        except Exception as e:
+            print(f"❌ Failed to send invitation to {to_email}: {e}")
+            return False
+
+    def send_venue_reservation_email(self, to_email: str, subject: str, body: str) -> bool:
+        """Send a venue reservation request email with custom subject and body."""
+        try:
+            msg = MIMEText(body, 'plain')
+            msg['Subject'] = subject
+            msg['From'] = self.smtp_user
+            msg['To'] = to_email
+            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=15) as server:
+                server.login(self.smtp_user, self.smtp_pass)
+                server.send_message(msg)
+            print(f"✅ Venue reservation email sent to {to_email}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to send venue reservation email to {to_email}: {e}")
+            return False
+
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
+
+
+@app.middleware("http")
+async def accept_local_service_calls(request: Request, call_next):
+    if request.headers.get("origin") or request.headers.get("sec-fetch-site"):
+        return JSONResponse({"detail": "Use the local Wendy web app."}, status_code=403)
+    return await call_next(request)
+
+
+def require_mail_configuration():
+    if os.getenv("WENDY_ENABLE_LIVE") != "true" or os.getenv("WENDY_ALLOW_EMAIL") != "true":
+        raise HTTPException(status_code=403, detail="Live email is disabled.")
+    if not os.getenv("WENDY_SMTP_USER") or not os.getenv("WENDY_SMTP_PASSWORD"):
+        raise HTTPException(status_code=503, detail="Configure SMTP before sending email.")
+
+
+# Global instances
+db: Database | None = None
+email_service: EmailService | None = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database and email service on startup."""
+    global db, email_service
+
+    # Setup database
+    db_path = Path(__file__).parent / "wedding.db"
+    db = Database(str(db_path))
+    await db.connect()
+    print(f"✅ Connected to SQLite database: {db_path}")
+
+    # Setup email service
+    email_service = EmailService()
+    print("✅ Email service initialized")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown."""
+    global db
+    if db:
+        await db.close()
+        print("🔒 Closed database connection")
+
+
+# HTTP endpoints
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+@app.post("/tools/send_invite", response_model=SendInviteResponse)
+async def send_invite(request: SendInviteRequest):
+    """
+    Send a wedding invitation email and add the guest to the database.
+    """
+    require_mail_configuration()
+    if not db or not email_service:
+        raise HTTPException(status_code=500, detail="Server not initialized")
+
+    try:
+        # Send email invitation
+        guest_name = request.name or request.email
+        email_sent = email_service.send_invitation(request.email, guest_name)
+
+        if not email_sent:
+            return SendInviteResponse(
+                result=f"❌ Failed to send invitation to {request.email}. Please try again."
+            )
+
+        # Add guest to database
+        guest_data = await db.add_guest(guest_name, request.email)
+
+        if guest_data:
+            return SendInviteResponse(
+                result=f"✅ Invitation sent to {request.email} and guest added to the database!"
+            )
+        else:
+            return SendInviteResponse(
+                result=f"✅ Invitation sent to {request.email}, but there was an issue adding to database."
+            )
+
+    except Exception as e:
+        return SendInviteResponse(
+            result=f"❌ Error processing invitation for {request.email}: {str(e)}"
+        )
+
+
+@app.post("/tools/update_rsvp", response_model=UpdateRSVPResponse)
+async def update_rsvp(request: UpdateRSVPRequest):
+    """
+    Update the RSVP status for a guest.
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Server not initialized")
+
+    try:
+        updated_guest = await db.update_guest_rsvp(request.email, request.rsvp)
+
+        if updated_guest:
+            return UpdateRSVPResponse(
+                result=f"✅ RSVP updated for {request.email} to '{request.rsvp}'"
+            )
+        else:
+            return UpdateRSVPResponse(
+                result=f"❌ Guest with email {request.email} not found."
+            )
+
+    except Exception as e:
+        return UpdateRSVPResponse(
+            result=f"❌ Error updating RSVP for {request.email}: {str(e)}"
+        )
+
+
+@app.post("/tools/find_venues", response_model=FindVenuesResponse)
+async def find_venues(request: FindVenuesRequest):
+    """
+    Find wedding venues using AI.
+    """
+    try:
+
+        http_client = httpx.Client(
+        headers={"anthropic-beta":"web-search-2025-03-05"}
+        )
+        client = anthropic.Anthropic(
+            # defaults to os.environ.get("ANTHROPIC_API_KEY")
+            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+            http_client=http_client
+        )
+
+
+        # Create the message with the beta API and web search tools
+        message = client.messages.create(
+            model=os.getenv("WENDY_ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+            max_tokens=1024,
+            temperature=1,
+            system="You are an AI agent designed to help with wedding planning. You have access to a tool which performs web searches to find and gather information about wedding venues in a specified location. Respond only with the final answer relevant to the user query. Do not show your reasoning, planning, or any intermediate steps. Format the response clearly with Markdown headings and bullet points as appropriate. ",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"""
+                                The user is looking for wedding venues in: {request.location}
+
+                                Please perform the following tasks:
+                                1. Use the web search tool to find wedding venues in {request.location}
+                                2. Select 3 top results from the search. Avoid encrypted pages
+                                3. For each selected venue:
+                                a. Visit the venue's website
+                                b. Scrape the following essential information:
+                                    - Venue name
+                                    - Address
+                                    - Email contact
+                                    - Phone number (if available)
+                                    - Capacity (if available)
+                                    - Website URL (if available)
+
+                                Present the gathered information in the following format only and nothing else. Do not show your reasoning, planning, or any intermediate steps:
+
+                                <venues>
+                                <venue>
+                                <name>[Venue Name]</name>
+                                <address>[Full Address]</address>
+                                <email>[Email Address]</email>
+                                <phone>[Phone Number]</phone>
+                                <capacity>[Capacity Information]</capacity>
+                                <website>[Website URL]</website>
+                                </venue>
+                                [Repeat for each venue]
+                                </venues>
+
+                                If you cannot find any suitable venues in the specified location, respond with:
+
+                                <error>Unable to find wedding venues in {request.location}. Please try a different location or expand your search area.</error>
+
+                                """
+                        }
+                    ]
+                }
+            ],
+            tools=[
+                {
+                    "name": "web_search",
+                    "type": "web_search_20250305",
+                    "max_uses": 5
+                }
+            ]
+
+        )
+
+        return FindVenuesResponse(result="\n".join(block.text for block in message.content if block.type == "text"))
+
+    except Exception as e:
+        return FindVenuesResponse(result=f"❌ Error finding venues: {str(e)}")
+
+
+@app.post("/tools/make_venue_reservation", response_model=VenueReservationResponse)
+async def make_venue_reservation(request: VenueReservationRequest):
+    """
+    Book, reserve, or make a reservation at a wedding venue by generating an AI-powered email and logging the attempt.
+    Use this endpoint whenever the user asks to book, reserve, or make a reservation at a venue. Example user requests: "Book Grand Ballroom for 120 guests on 2024-10-15", "Reserve a venue for my wedding", "Make a reservation at The Plaza Hotel".
+    Required fields: user_name, user_email, venue_name, venue_email, budget, guest_count, date, special_notes (optional).
+    """
+    require_mail_configuration()
+    if not db or not email_service:
+        raise HTTPException(status_code=500, detail="Server not initialized")
+    try:
+        # Compose prompt for OpenAI GPT-4o
+        prompt = f"""
+You are an expert wedding planner. Compose a professional wedding venue reservation request email using the following details. Output the subject line on the first line, then a blank line, then the email body.
+
+- Name: {request.user_name}
+- Email: {request.user_email}
+- Venue: {request.venue_name}
+- Date: {request.date}
+- Guest Count: {request.guest_count}
+- Budget: {request.budget}
+"""
+        if request.special_notes:
+            prompt += f"- Special Notes: {request.special_notes}\n"
+        # Call OpenAI GPT-4o
+        openai.api_key = os.environ.get("OPENAI_API_KEY")
+        ai_response = openai.chat.completions.create(
+            model=os.getenv("WENDY_OPENAI_MODEL", "gpt-4o"),
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=512,
+            temperature=0.7
+        )
+        ai_text = ai_response.choices[0].message.content.strip()
+        # Split subject and body
+        lines = ai_text.split("\n", 2)
+        subject = lines[0].strip()
+        if len(lines) > 2:
+            body = lines[2].strip()
+        else:
+            body = "\n".join(lines[1:]).strip()
+        # Send reservation email
+        email_sent = email_service.send_venue_reservation_email(
+            to_email=request.venue_email,
+            subject=subject,
+            body=body
+        )
+        status = "success" if email_sent else "failure"
+        error_message = None if email_sent else "Failed to send reservation email."
+        # Log reservation attempt
+        reservation = await db.add_venue_reservation(
+            user_name=request.user_name,
+            user_email=request.user_email,
+            venue_name=request.venue_name,
+            venue_email=request.venue_email,
+            budget=request.budget,
+            guest_count=request.guest_count,
+            date=request.date,
+            special_notes=request.special_notes,
+            status=status,
+            error_message=error_message
+        )
+        if email_sent:
+            return VenueReservationResponse(
+                result=f"✅ Reservation request sent to {request.venue_name} ({request.venue_email})!",
+                reservation_id=reservation["id"] if reservation else None
+            )
+        else:
+            return VenueReservationResponse(
+                result=f"❌ Failed to send reservation request to {request.venue_name}.",
+                reservation_id=reservation["id"] if reservation else None,
+                error=error_message
+            )
+    except Exception as e:
+        # Log failure
+        reservation = await db.add_venue_reservation(
+            user_name=request.user_name,
+            user_email=request.user_email,
+            venue_name=request.venue_name,
+            venue_email=request.venue_email,
+            budget=request.budget,
+            guest_count=request.guest_count,
+            date=request.date,
+            special_notes=request.special_notes,
+            status="failure",
+            error_message=str(e)
+        )
+        return VenueReservationResponse(
+            result=f"❌ Error making reservation for {request.venue_name}: {str(e)}",
+            reservation_id=reservation["id"] if reservation else None,
+            error=str(e)
+        )
+
+
+@app.post("/resources/save_guest", response_model=Guest)
+async def save_guest(request: SaveGuestRequest):
+    if os.getenv("WENDY_ENABLE_LIVE") != "true":
+        raise HTTPException(status_code=403, detail="Live guest storage is disabled.")
+    if not db or not db.conn:
+        raise HTTPException(status_code=503, detail="Database not initialized.")
+    cursor = await db.conn.execute(
+        """
+        INSERT INTO guests (name, email, rsvp, created_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(email) DO UPDATE SET name=excluded.name, rsvp=excluded.rsvp
+        RETURNING id, name, email, rsvp, created_at
+        """,
+        (request.name, request.email, request.rsvp),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    await db.conn.commit()
+    return Guest(**dict(row))
+
+
+@app.get("/resources/list_guests", response_model=List[Guest])
+async def list_guests():
+    """List all guests in the wedding database."""
+    if not db:
+        raise HTTPException(status_code=500, detail="Server not initialized")
+
+    guest_rows = await db.get_all_guests()
+
+    guests = []
+    for row in guest_rows:
+        guests.append(
+            Guest(
+                id=row["id"],
+                name=row["name"],
+                email=row["email"],
+                rsvp=row["rsvp"],
+                created_at=row["created_at"],
+            )
+        )
+
+    return guests
+
+
+@app.get("/resources/get_guest/{guest_id}", response_model=Guest)
+async def get_guest(guest_id: int):
+    """Get a specific guest by ID."""
+    if not db:
+        raise HTTPException(status_code=500, detail="Server not initialized")
+
+    # Get all guests and find the one we want
+    guest_rows = await db.get_all_guests()
+
+    for row in guest_rows:
+        if row["id"] == guest_id:
+            return Guest(
+                id=row["id"],
+                name=row["name"],
+                email=row["email"],
+                rsvp=row["rsvp"],
+                created_at=row["created_at"],
+            )
+
+    raise HTTPException(status_code=404, detail="Guest not found")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting Wendy Wedding Planning HTTP Server...")
+    uvicorn.run(app, host="127.0.0.1", port=8000)

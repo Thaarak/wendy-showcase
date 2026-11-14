@@ -1,0 +1,6 @@
+aiosqlite>=0.21,<1
+anthropic>=0.58,<1
+fastapi>=0.116,<1
+httpx>=0.28,<1
+openai>=1.97,<3
+uvicorn>=0.35,<1
